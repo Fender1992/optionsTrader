@@ -1,416 +1,392 @@
-from fastapi import FastAPI, Request, HTTPException, Depends, Form, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+#!/usr/bin/env python
+"""
+Maximum Profit Options Trading App
+Streamlined for explosive account growth through high-frequency day trading
+"""
+
+import asyncio
+import os
+from datetime import datetime
+import logging
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from passlib.context import CryptContext
-import pyotp
-import os
-import json
-import secrets
-from datetime import datetime, timedelta
-from typing import Optional, Dict
-import pandas as pd
-import plotly.graph_objs as go
-import plotly.utils
-from src.jobs.scheduler import TradingScheduler
-from src.alerts.notifier import EquityMilestoneTracker, Notifier
-import logging
 
-logging.basicConfig(level=logging.INFO)
+from src.execution.profit_maximizer import ProfitMaximizer
+from src.strategies.max_profit_day_trading import MaxProfitDayTradingStrategy
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading.log'),
+        logging.StreamHandler()
+    ]
+)
+
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Options Trading App")
+app = FastAPI(title="Maximum Profit Options Trading")
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# Mount static files if directory exists
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-security = HTTPBasic()
+# Initialize templates if directory exists  
+if os.path.exists("templates"):
+    templates = Jinja2Templates(directory="templates")
 
-scheduler = TradingScheduler()
-
-SESSIONS = {}
-
-class AuthManager:
+class MaxProfitTradingApp:
+    """Main trading application for maximum profit generation"""
+    
     def __init__(self):
-        self.username = os.getenv('APP_USERNAME', 'admin@example.com')
-        self.password_hash = os.getenv('APP_PASSWORD_HASH', '')
-        self.totp_secret = os.getenv('TOTP_SECRET', '')
-        self.ip_allowlist = os.getenv('IP_ALLOWLIST', '').split(',') if os.getenv('IP_ALLOWLIST') else []
-    
-    def verify_password(self, plain_password: str) -> bool:
-        if not self.password_hash:
-            return plain_password == "admin"
-        return pwd_context.verify(plain_password, self.password_hash)
-    
-    def verify_totp(self, token: str) -> bool:
-        if not self.totp_secret:
-            return True
-        totp = pyotp.TOTP(self.totp_secret)
-        return totp.verify(token, valid_window=1)
-    
-    def verify_ip(self, client_ip: str) -> bool:
-        if not self.ip_allowlist:
-            return True
-        return client_ip in self.ip_allowlist
-    
-    def create_session(self, username: str) -> str:
-        session_id = secrets.token_urlsafe(32)
-        SESSIONS[session_id] = {
-            'username': username,
-            'created': datetime.now(),
-            'last_activity': datetime.now()
+        self.account_size = float(os.getenv('INITIAL_CAPITAL', '10.0'))
+        self.api_key = os.getenv('ALPHA_VANTAGE_API_KEY') or os.getenv('ALPHAVANTAGE_API_KEY')
+        if not self.api_key:
+            raise ValueError("Alpha Vantage API key required. Check .env file.")
+        self.strategy = MaxProfitDayTradingStrategy(self.account_size)
+        self.profit_maximizer = None
+        self.is_running = False
+        
+    def get_status(self):
+        """Get current trading status"""
+        config = self.strategy.get_current_config()
+        
+        # Calculate profit potential
+        daily_profit_potential = (
+            config['account_size'] * 
+            config['position_size_pct'] * 
+            config['profit_target'] * 
+            config['trades_per_day']
+        )
+        
+        return {
+            'account_size': config['account_size'],
+            'daily_trades': config['trades_per_day'],
+            'position_size_pct': config['position_size_pct'] * 100,
+            'profit_target_pct': config['profit_target'] * 100,
+            'stop_loss_pct': config['stop_loss'] * 100,
+            'max_concurrent': config['max_concurrent'],
+            'target_symbols': config['target_symbols'],
+            'daily_profit_potential': daily_profit_potential,
+            'weekly_target': daily_profit_potential * 5,
+            'monthly_target': daily_profit_potential * 22,
+            'is_running': self.is_running,
+            'current_time': datetime.now().strftime('%H:%M:%S')
         }
-        return session_id
-    
-    def verify_session(self, session_id: str) -> Optional[Dict]:
-        if session_id not in SESSIONS:
-            return None
         
-        session = SESSIONS[session_id]
+    async def start_trading(self):
+        """Start the maximum profit trading system"""
+        if self.is_running:
+            return
+            
+        self.is_running = True
+        self.profit_maximizer = ProfitMaximizer(self.account_size, self.api_key)
         
-        if datetime.now() - session['last_activity'] > timedelta(hours=1):
-            del SESSIONS[session_id]
-            return None
+        logger.info(f"🚀 Starting maximum profit trading with ${self.account_size:.2f}")
         
-        session['last_activity'] = datetime.now()
-        return session
+        try:
+            await self.profit_maximizer.start_trading()
+        except Exception as e:
+            logger.error(f"Trading error: {e}")
+            self.is_running = False
+            
+    def stop_trading(self):
+        """Stop the trading system"""
+        self.is_running = False
+        logger.info("⏹️  Trading stopped")
 
-auth_manager = AuthManager()
-
-def get_current_user(request: Request) -> Dict:
-    session_id = request.cookies.get("session_id")
-    if not session_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    session = auth_manager.verify_session(session_id)
-    if not session:
-        raise HTTPException(status_code=401, detail="Session expired")
-    
-    return session
-
-@app.on_event("startup")
-async def startup_event():
-    scheduler.start()
-    logger.info("Application started")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    scheduler.stop()
-    logger.info("Application stopped")
+# Global app instance
+trading_app = MaxProfitTradingApp()
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
-    try:
-        user = get_current_user(request)
-        return RedirectResponse(url="/dashboard")
-    except:
-        return RedirectResponse(url="/login")
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request})
-
-@app.post("/login")
-async def login(
-    request: Request,
-    username: str = Form(...),
-    password: str = Form(...),
-    totp_code: str = Form(None)
-):
-    client_ip = request.client.host
+    """Main dashboard"""
+    status = trading_app.get_status()
     
-    if not auth_manager.verify_ip(client_ip):
-        raise HTTPException(status_code=403, detail="IP not allowed")
-    
-    if username != auth_manager.username:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    if not auth_manager.verify_password(password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    if auth_manager.totp_secret and not auth_manager.verify_totp(totp_code):
-        raise HTTPException(status_code=401, detail="Invalid 2FA code")
-    
-    session_id = auth_manager.create_session(username)
-    
-    response = RedirectResponse(url="/dashboard", status_code=302)
-    response.set_cookie(
-        key="session_id",
-        value=session_id,
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        max_age=3600
-    )
-    
-    return response
-
-@app.get("/logout")
-async def logout(request: Request):
-    session_id = request.cookies.get("session_id")
-    if session_id and session_id in SESSIONS:
-        del SESSIONS[session_id]
-    
-    response = RedirectResponse(url="/login")
-    response.delete_cookie("session_id")
-    return response
-
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request, user: Dict = Depends(get_current_user)):
-    state = scheduler.trading_state
-    
-    positions = state.get('positions', [])
-    account_info = state.get('account_info', {})
-    
-    # Get milestone info
-    milestone_info = scheduler.milestone_tracker.get_next_target()
-    
-    pnl_data = []
-    if os.path.exists(scheduler.pnl_file):
-        pnl_df = pd.read_csv(scheduler.pnl_file)
-        if not pnl_df.empty:
-            pnl_data = pnl_df.tail(30).to_dict('records')
-    
-    equity_chart = create_equity_chart(pnl_data)
-    
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
-        "user": user,
-        "positions": positions,
-        "account_info": account_info,
-        "capital": state.get('capital', 10000),
-        "initial_capital": state.get('initial_capital', 10000),
-        "kill_switch": os.getenv('KILL_SWITCH', 'false'),
-        "execution_mode": os.getenv('EXECUTION_MODE', 'paper'),
-        "equity_chart": equity_chart,
-        "last_update": state.get('last_update', 'Never'),
-        "milestone_info": milestone_info
-    })
-
-@app.post("/api/toggle-kill-switch")
-async def toggle_kill_switch(user: Dict = Depends(get_current_user)):
-    current = os.getenv('KILL_SWITCH', 'false')
-    new_value = 'false' if current == 'true' else 'true'
-    os.environ['KILL_SWITCH'] = new_value
-    
-    scheduler._log_action("kill_switch_toggle", {
-        "user": user['username'],
-        "new_value": new_value
-    })
-    
-    return {"kill_switch": new_value}
-
-@app.post("/api/set-capital")
-async def set_capital(
-    request: Request,
-    user: Dict = Depends(get_current_user)
-):
-    data = await request.json()
-    capital = float(data.get('capital', 10000))
-    
-    scheduler.trading_state['capital'] = capital
-    scheduler._save_state()
-    
-    scheduler._log_action("capital_update", {
-        "user": user['username'],
-        "new_capital": capital
-    })
-    
-    return {"capital": capital}
-
-@app.post("/api/toggle-mode")
-async def toggle_mode(user: Dict = Depends(get_current_user)):
-    current = os.getenv('EXECUTION_MODE', 'paper')
-    new_mode = 'live' if current == 'paper' else 'paper'
-    os.environ['EXECUTION_MODE'] = new_mode
-    
-    scheduler._log_action("mode_toggle", {
-        "user": user['username'],
-        "new_mode": new_mode
-    })
-    
-    return {"execution_mode": new_mode}
-
-@app.get("/api/positions")
-async def get_positions(user: Dict = Depends(get_current_user)):
-    positions = scheduler.broker.get_positions()
-    return {"positions": positions}
-
-@app.get("/api/logs")
-async def get_logs(user: Dict = Depends(get_current_user)):
-    logs = []
-    if os.path.exists(scheduler.log_file):
-        with open(scheduler.log_file, 'r') as f:
-            logs = json.load(f)
-    
-    return {"logs": logs[-100:]}
-
-@app.get("/api/pnl")
-async def get_pnl(user: Dict = Depends(get_current_user)):
-    if os.path.exists(scheduler.pnl_file):
-        pnl_df = pd.read_csv(scheduler.pnl_file)
-        return {"pnl": pnl_df.tail(100).to_dict('records')}
-    return {"pnl": []}
-
-@app.post("/api/run-job")
-async def run_job(
-    request: Request,
-    user: Dict = Depends(get_current_user)
-):
-    data = await request.json()
-    job_name = data.get('job')
-    
-    if job_name == 'update_data':
-        scheduler.update_data()
-    elif job_name == 'build_features':
-        scheduler.build_features()
-    elif job_name == 'generate_signals':
-        scheduler.generate_signals()
-    elif job_name == 'execute_trades':
-        scheduler.execute_trades()
-    elif job_name == 'reconcile':
-        scheduler.reconcile_positions()
-    else:
-        raise HTTPException(status_code=400, detail="Invalid job name")
-    
-    return {"status": "Job started", "job": job_name}
-
-@app.get("/api/alerts/equity-doubling")
-async def get_equity_doubling(user: Dict = Depends(get_current_user)):
-    milestone_info = scheduler.milestone_tracker.get_next_target()
-    return milestone_info
-
-@app.post("/api/alerts/equity-doubling/reset")
-async def reset_equity_baseline(
-    request: Request,
-    user: Dict = Depends(get_current_user)
-):
-    data = await request.json()
-    totp_code = data.get('totp_code')
-    
-    # Verify TOTP if configured
-    if auth_manager.totp_secret and not auth_manager.verify_totp(totp_code):
-        raise HTTPException(status_code=401, detail="Invalid 2FA code")
-    
-    current_equity = scheduler.trading_state.get('account_info', {}).get('total_equity', 
-                                                   scheduler.trading_state.get('capital', 10000))
-    
-    result = scheduler.milestone_tracker.reset_baseline(current_equity)
-    
-    scheduler._log_action("baseline_reset", {
-        "user": user['username'],
-        "new_baseline": current_equity
-    })
-    
-    return result
-
-@app.post("/api/alerts/test")
-async def test_notification(
-    request: Request,
-    user: Dict = Depends(get_current_user)
-):
-    data = await request.json()
-    totp_code = data.get('totp_code')
-    
-    # Verify TOTP if configured
-    if auth_manager.totp_secret and not auth_manager.verify_totp(totp_code):
-        raise HTTPException(status_code=401, detail="Invalid 2FA code")
-    
-    notifier = Notifier(scheduler.config)
-    success = notifier.send_test_notification()
-    
-    return {"success": success, "message": "Test notification sent" if success else "Failed to send"}
-
-@app.get("/api/notifications")
-async def get_notifications(user: Dict = Depends(get_current_user)):
-    notifications_file = "artifacts/live/pwa_notifications.json"
-    
-    if os.path.exists(notifications_file):
-        with open(notifications_file, 'r') as f:
-            notifications = json.load(f)
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Maximum Profit Options Trading</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ 
+                font-family: Arial, sans-serif; 
+                margin: 20px; 
+                background: #f5f5f5;
+            }}
+            .container {{ 
+                max-width: 1200px; 
+                margin: 0 auto; 
+                background: white; 
+                padding: 20px; 
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }}
+            .header {{ 
+                text-align: center; 
+                color: #1a73e8; 
+                margin-bottom: 30px;
+                border-bottom: 3px solid #1a73e8;
+                padding-bottom: 20px;
+            }}
+            .status-grid {{ 
+                display: grid; 
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); 
+                gap: 20px; 
+                margin-bottom: 30px;
+            }}
+            .status-card {{ 
+                background: #f8f9fa; 
+                padding: 20px; 
+                border-radius: 8px; 
+                border-left: 4px solid #1a73e8;
+            }}
+            .status-card h3 {{ 
+                margin-top: 0; 
+                color: #333;
+            }}
+            .metric {{ 
+                display: flex; 
+                justify-content: space-between; 
+                margin: 10px 0;
+                padding: 5px 0;
+                border-bottom: 1px solid #eee;
+            }}
+            .metric:last-child {{
+                border-bottom: none;
+            }}
+            .value {{ 
+                font-weight: bold; 
+                color: #28a745;
+            }}
+            .controls {{ 
+                text-align: center; 
+                margin: 30px 0;
+            }}
+            .btn {{ 
+                padding: 15px 30px; 
+                margin: 10px; 
+                border: none; 
+                border-radius: 5px; 
+                font-size: 16px; 
+                cursor: pointer;
+                transition: all 0.3s;
+            }}
+            .btn-primary {{ 
+                background: #28a745; 
+                color: white;
+            }}
+            .btn-primary:hover {{
+                background: #218838;
+            }}
+            .btn-danger {{ 
+                background: #dc3545; 
+                color: white;
+            }}
+            .btn-danger:hover {{
+                background: #c82333;
+            }}
+            .running {{ 
+                color: #28a745; 
+                font-weight: bold;
+            }}
+            .stopped {{ 
+                color: #dc3545; 
+                font-weight: bold;
+            }}
+            .symbols {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+            }}
+            .symbol {{
+                background: #1a73e8;
+                color: white;
+                padding: 5px 10px;
+                border-radius: 15px;
+                font-size: 12px;
+            }}
+            .refresh-btn {{
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                background: #1a73e8;
+                color: white;
+                border: none;
+                padding: 10px 15px;
+                border-radius: 5px;
+                cursor: pointer;
+            }}
+        </style>
+        <script>
+            function refreshPage() {{
+                window.location.reload();
+            }}
+            
+            // Auto refresh every 30 seconds
+            setInterval(refreshPage, 30000);
+            
+            async function startTrading() {{
+                document.getElementById('start-btn').disabled = true;
+                document.getElementById('start-btn').innerText = 'Starting...';
+                
+                try {{
+                    const response = await fetch('/start', {{ method: 'POST' }});
+                    if (response.ok) {{
+                        setTimeout(refreshPage, 2000);
+                    }}
+                }} catch (error) {{
+                    console.error('Error starting trading:', error);
+                    document.getElementById('start-btn').disabled = false;
+                    document.getElementById('start-btn').innerText = 'Start Trading';
+                }}
+            }}
+            
+            async function stopTrading() {{
+                const response = await fetch('/stop', {{ method: 'POST' }});
+                if (response.ok) {{
+                    setTimeout(refreshPage, 1000);
+                }}
+            }}
+        </script>
+    </head>
+    <body>
+        <button class="refresh-btn" onclick="refreshPage()">🔄 Refresh</button>
         
-        # Return only unread notifications
-        unread = [n for n in notifications if not n.get('read', False)]
-        return {"notifications": unread}
+        <div class="container">
+            <div class="header">
+                <h1>🚀 MAXIMUM PROFIT OPTIONS TRADING</h1>
+                <p>High-Frequency Day Trading for Explosive Account Growth</p>
+                <p>Status: <span class="{'running' if status['is_running'] else 'stopped'}">
+                    {'🟢 TRADING ACTIVE' if status['is_running'] else '🔴 STOPPED'}
+                </span> | Time: {status['current_time']}</p>
+            </div>
+            
+            <div class="status-grid">
+                <div class="status-card">
+                    <h3>📊 Account Configuration</h3>
+                    <div class="metric">
+                        <span>Account Size:</span>
+                        <span class="value">${status['account_size']:.2f}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Daily Trades:</span>
+                        <span class="value">{status['daily_trades']}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Position Size:</span>
+                        <span class="value">{status['position_size_pct']:.1f}%</span>
+                    </div>
+                    <div class="metric">
+                        <span>Profit Target:</span>
+                        <span class="value">{status['profit_target_pct']:.1f}%</span>
+                    </div>
+                    <div class="metric">
+                        <span>Stop Loss:</span>
+                        <span class="value">{status['stop_loss_pct']:.1f}%</span>
+                    </div>
+                </div>
+                
+                <div class="status-card">
+                    <h3>💰 Profit Potential</h3>
+                    <div class="metric">
+                        <span>Daily Target:</span>
+                        <span class="value">${status['daily_profit_potential']:.2f}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Weekly Target:</span>
+                        <span class="value">${status['weekly_target']:.2f}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Monthly Target:</span>
+                        <span class="value">${status['monthly_target']:.2f}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Max Concurrent:</span>
+                        <span class="value">{status['max_concurrent']}</span>
+                    </div>
+                </div>
+                
+                <div class="status-card">
+                    <h3>🎯 Target Instruments</h3>
+                    <div class="symbols">
+                        {''.join([f'<span class="symbol">{symbol}</span>' for symbol in status['target_symbols']])}
+                    </div>
+                </div>
+                
+                <div class="status-card">
+                    <h3>⏰ Trading Windows</h3>
+                    <div class="metric">
+                        <span>09:30-10:30:</span>
+                        <span class="value">Opening (4 trades)</span>
+                    </div>
+                    <div class="metric">
+                        <span>12:00-13:00:</span>
+                        <span class="value">Lunch (2 trades)</span>
+                    </div>
+                    <div class="metric">
+                        <span>14:30-15:30:</span>
+                        <span class="value">Power Hour (4 trades)</span>
+                    </div>
+                    <div class="metric">
+                        <span>15:30-16:00:</span>
+                        <span class="value">Close (2 trades)</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="controls">
+                {'<button id="stop-btn" class="btn btn-danger" onclick="stopTrading()">⏹️ Stop Trading</button>' if status['is_running'] else '<button id="start-btn" class="btn btn-primary" onclick="startTrading()">🚀 Start Maximum Profit Trading</button>'}
+            </div>
+            
+            <div style="text-align: center; margin-top: 30px; padding: 20px; background: #fff3cd; border-radius: 5px;">
+                <h4>⚠️ Risk Warnings</h4>
+                <p>This system uses aggressive position sizing for maximum profit potential.<br>
+                Only trade with capital you can afford to lose.<br>
+                Past performance does not guarantee future results.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
     
-    return {"notifications": []}
+    return HTMLResponse(content=html_content)
 
-@app.post("/api/notifications/mark-read")
-async def mark_notifications_read(
-    request: Request,
-    user: Dict = Depends(get_current_user)
-):
-    data = await request.json()
-    notification_ids = data.get('ids', [])
-    
-    notifications_file = "artifacts/live/pwa_notifications.json"
-    
-    if os.path.exists(notifications_file):
-        with open(notifications_file, 'r') as f:
-            notifications = json.load(f)
-        
-        for notif in notifications:
-            if notif.get('id') in notification_ids:
-                notif['read'] = True
-        
-        with open(notifications_file, 'w') as f:
-            json.dump(notifications, f, indent=2)
-    
-    return {"success": True}
+@app.post("/start")
+async def start_trading():
+    """Start trading endpoint"""
+    if not trading_app.is_running:
+        # Start trading in background
+        asyncio.create_task(trading_app.start_trading())
+        return {"status": "started"}
+    return {"status": "already_running"}
 
-@app.get("/manifest.json")
-async def manifest():
-    return {
-        "name": "Options Trading App",
-        "short_name": "Options",
-        "description": "Automated options trading platform",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#ffffff",
-        "theme_color": "#1a73e8",
-        "icons": [
-            {
-                "src": "/static/icon-192.png",
-                "sizes": "192x192",
-                "type": "image/png"
-            },
-            {
-                "src": "/static/icon-512.png",
-                "sizes": "512x512",
-                "type": "image/png"
-            }
-        ]
-    }
+@app.post("/stop") 
+async def stop_trading():
+    """Stop trading endpoint"""
+    trading_app.stop_trading()
+    return {"status": "stopped"}
 
-def create_equity_chart(pnl_data: list) -> str:
-    if not pnl_data:
-        return ""
-    
-    df = pd.DataFrame(pnl_data)
-    
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=pd.to_datetime(df['timestamp']),
-        y=df['total_equity'],
-        mode='lines',
-        name='Total Equity',
-        line=dict(color='#1a73e8', width=2)
-    ))
-    
-    fig.update_layout(
-        title="Portfolio Equity",
-        xaxis_title="Date",
-        yaxis_title="Value ($)",
-        height=400,
-        template="plotly_white",
-        hovermode='x unified'
-    )
-    
-    return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+@app.get("/api/status")
+async def get_status():
+    """Get current status as JSON"""
+    return trading_app.get_status()
 
 if __name__ == "__main__":
     import uvicorn
+    
+    # Create logs directory
+    os.makedirs('logs', exist_ok=True)
+    
+    print("\n" + "="*60)
+    print("MAXIMUM PROFIT OPTIONS TRADING APP")
+    print("="*60)
+    print("Starting web interface on http://localhost:8080")
+    print("Press Ctrl+C to stop")
+    print("="*60)
+    
     uvicorn.run(app, host="0.0.0.0", port=8080)
