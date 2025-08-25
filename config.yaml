@@ -1,0 +1,60 @@
+provider: "alphavantage"
+alpha:
+  function: "TIME_SERIES_DAILY_ADJUSTED"
+  outputsize: "full"
+  max_workers: 6
+
+universe_file: data/symbols.csv
+start_date: "2014-01-01"
+end_date: "2025-01-01"
+
+# Labeling & backtest
+label_horizon_days: 21
+rebalance_freq: "W"
+top_n: 20
+benchmark: "SPY"
+
+# News/sentiment
+news:
+  providers: ["alphavantage"]
+  lookback_days: 3650
+  min_confidence: 0.55
+  sentiment_window: 5       # days to roll sentiment
+  exclude_earnings_window:  # days to avoid opening new positions around earnings
+    before: 1
+    after: 1
+
+# Options strategy
+options:
+  default_dte: [30, 45]     # target DTE window
+  target_delta: 0.35        # long calls delta target for bullish
+  put_spread_delta: 0.25    # vertical spread short put delta for bullish alt
+  max_positions: 10
+  max_weight_per_name: 0.15
+  min_notional_per_trade: 200
+  take_profit: 0.5          # +50%
+  stop_loss: -0.5           # -50%
+  iv_rank_window: 252
+
+# Execution
+execution:
+  broker: "tradier"         # tradier only for now
+  venue: "options"
+  trade_days: ["Mon","Tue","Wed","Thu","Fri"]
+  trade_window:
+    start: "09:35"          # America/New_York
+    end:   "15:55"
+  fractional_allowed: false
+  cash_buffer: 0.03
+
+# Alerts and notifications
+alerts:
+  equity_doubling:
+    enabled: true
+    baseline_mode: "initial_capital"   # "initial_capital" | "custom"
+    custom_baseline: null              # set a number to override, e.g., 10000
+    channels: ["pwa_push", "email"]    # "pwa_push" | "email" | "sms"
+    email_to: "you@example.com"
+    sms_to: null
+    check_freq: "D"                    # D = daily after close; can be "W" or "M"
+    timezone: "America/New_York"
